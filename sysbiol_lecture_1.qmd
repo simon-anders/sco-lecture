@@ -1,0 +1,415 @@
+---
+title: "Single-cell analysis I"
+format: html
+---
+
+## Course "Advanced Computational Systems Biology"
+
+University of Heidelberg, summer term 2023
+
+## Single-cell RNA-Seq data analysis
+### Day 1: Standard analysis with Seurat
+
+Simon Anders
+
+### Note
+
+In this document I have put together the R code that we have discussed in the 
+two days of the course that I have tought. This is just meant as a reminder, not as a
+self-contained tutorial
+
+### Example dataset
+
+As example data, we have used the RNA-Seq part of the benchmark dataset produced
+for this paper: 
+
+Luecken et al. (2022): *Benchmarking atlas-level data integration in single-cell genomics*.
+Nature Methods, 19:41. https://doi.org/10.1038/s41592-021-01336-8
+
+We use the Seurat package (https://satijalab.org/seurat/) for data analysis, and
+the matrix package to load the data:
+
+```{r}
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(ggplot2)
+  library(Seurat)
+})
+```
+
+### Loading the data
+
+The data is available here: https://papagei.bioquant.uni-heidelberg.de/simon/Vl23sysbiol/Luecken2021_GEx/
+
+The big files contain all cells, the cells with `s4d1` only those from sample 4 / donor 1. We load them:
+
+```{r}
+obs <- read.csv( "/mnt/raid/anders/tmp/neurips2021BMMC_10XMultiome_GEX/obs_s4d1.csv.gz", row.names=1 )
+var <- read.csv( "/mnt/raid/anders/tmp/neurips2021BMMC_10XMultiome_GEX/var.csv.gz", row.names=1 )
+counts <- readMM( "/mnt/raid/anders/tmp/neurips2021BMMC_10XMultiome_GEX/counts_s4d1.mtx.gz" )
+```
+
+Here's the data
+
+The count matrix (top-left corner; only zeroes), and the matrix dimensions:
+
+```{r}
+counts[ 1:5, 1:5 ]
+cat( "\n" )
+
+dim( counts )
+```
+The cell annotation
+
+```{r}
+dim( obs )
+
+head(obs)
+```
+
+The gene annotation
+
+```{r}
+dim( var )
+
+head(var)
+```
+
+Copy over cell and gene names:
+
+```{r}
+rownames(counts) <- rownames(obs)
+colnames(counts) <- rownames(var)
+```
+
+Create a Seurat object:
+
+```{r}
+seu <- CreateSeuratObject( 
+  t(counts), 
+  meta.data = obs[,c("cell_type","batch","Samplename","DonorNumber") ] )
+```
+
+### Standard Seurat analysis
+
+Run a standard analysis
+
+```{r}
+set.seed( 12345678 )
+
+seu <- NormalizeData( seu )
+seu <- FindVariableFeatures( seu )
+seu <- ScaleData( seu )
+seu <- RunPCA( seu )
+seu <- RunUMAP( seu, dims=1:20 )
+seu <- FindNeighbors( seu, dims = 1:20 )
+seu <- FindClusters( seu, resolution = 0.5 )
+```
+
+The UMAP:
+
+```{r}
+UMAPPlot( seu, label=TRUE ) + coord_equal()
+```
+
+### Sleepwalk
+
+Inspect the UMAP with Sleepwalk (not run):
+
+```r
+sleepwalk::sleepwalk( 
+  seu@reductions$umap@cell.embeddings,
+  seu@reductions$pca@cell.embeddings )
+```
+
+Here, we have pulled from the Seurat object the 2D UMAP coordinates for all cells
+and the 20-dim PCA coordinates.
+
+For more on Sleepwalk, see here: https://anders-biostat.github.io/sleepwalk/
+
+
+### Inspection 
+
+Next, we inspect the object and make a few comparisons.
+
+First: For each cell, the total count (sum over all genes) is in the meta-data column
+`nCount_RNA`. Compare that this is the same as what we get if we add up the counts
+ourselves. 
+
+```{r}
+plot( colSums( seu@assays$RNA@counts ), seu@meta.data$nCount_RNA )
+```
+Next, we compare the normalized data (in `seu@assays$RNA@data`) with computing the 
+normalization ourselves, using the formula $y=\log(k/s \cdot 10^4 + 1)$, with $k$
+the count for a gene, $s$ the total count of the cell (summed over all the genes),
+and $y$ the log-normalized data. To see that this is infact the formula that Seurat has used
+we compare (for the gene ACTB):
+
+```{r}
+plot(
+  log( seu@assays$RNA@counts["ACTB",] / seu@meta.data$nCount_RNA * 1e4 + 1 ),
+  seu@assays$RNA@data["ACTB",] )
+```
+A histogram of th expression of ACTB:
+
+```{r}
+hist( seu@assays$RNA@data["ACTB",] )
+```
+
+### Gene expression means by cluster
+
+The clusters are stored here:
+
+```{r}
+head( seu@meta.data$seurat_clusters )
+```
+
+Task: What is the average expression (on the log scale) of ACTB in the cells of Cluster 3?
+
+Solution: 
+
+```{r}
+# Which cells are in cluster 3
+w <- seu@meta.data$seurat_clusters == 3
+head( w )
+```
+
+```{r}
+# Get the row for ACTB and all columns from cluster 3
+head( seu@assays$RNA@data[ "ACTB", w ]  )
+```
+
+```{r}
+# Take the mean of all these values
+mean( seu@assays$RNA@data[ "ACTB", w ] )
+```
+How to get the means for cluster 3 for all genes?
+
+```{r}
+# Take all rows (all genes),  but only the columns for cells in w
+seu@assays$RNA@data[ , w ][ 1:5, 1:5 ]
+cat( "\n\n\n" )
+
+# Take the mean of each row
+head( rowMeans( seu@assays$RNA@data[ , w ] ) )
+```
+Here is a function that does all this:
+
+```{r}
+# A function to get gene means for a cluster
+gene_means_for_cluster <- function(cl) {
+  w <- seu@meta.data$seurat_clusters == cl
+  rowMeans( seu@assays$RNA@data[ , w ] )
+}
+```
+
+Try it out, look at ACTB
+
+```{r}
+gene_means_for_cluster(3)["ACTB"]
+```
+
+Call this function for all clusters
+
+```{r}
+#Call this function for all clusters
+gene_means <- sapply( 0:14, gene_means_for_cluster )
+
+# Set column names
+colnames(gene_means) <- sprintf( "Cl_%02d", 0:14 )
+gene_means[1:5,1:5]
+```
+
+Indexing this matrix:
+
+```{r}
+gene_means["ACTB",3]
+gene_means["ACTB","Cl_03"]
+```
+
+### Finding interesting genes
+
+Which genes vary a lot across clusters?
+
+```{r}
+library( matrixStats )
+
+gene_vars_across_clusters <- rowVars( gene_means, useNames=TRUE )
+
+head( gene_vars_across_clusters )
+```
+Sort this:
+
+```{r}
+sort( gene_vars_across_clusters, decreasing=TRUE )[1:20]
+```
+Store the top 50:
+```{r}
+interesting_genes <- names( sort( 
+  gene_vars_across_clusters, decreasing=TRUE )[1:50] )
+```
+
+Center the gene means:
+
+```{r}
+centered_gene_means <- gene_means - rowMeans(gene_means)
+```
+
+Make a heatmap
+
+```{r}
+heatmap( 
+  centered_gene_means[ interesting_genes, ], 
+  scale="none", zlim=c(-4,4),
+  col=colorRampPalette(c("blue","gray","red"))(100) )
+```
+
+### Identifying cell types
+
+From this heatmap, we can identify the cell types in the clusters. Clusters 6 and 14
+clearly contain erythrocytes and their progenitors. (They express hemoglobin genes.)
+
+We can also check for known marker genes
+
+```{r}
+lymphoid_genes <- c( "CD3D", "CD3E", "CD3G", "CD19", "MS4A1", "PAX5", "TRA", "TRB", "TRG", "TRD", "CD79A", "CD79B", "RAG1", "RAG2" )  # provided by ChatGPT
+
+genes <- intersect( lymphoid_genes, rownames(seu) )
+
+heatmap( 
+  centered_gene_means[ genes, ], 
+  scale="none", zlim=c(-4,4),
+  col=colorRampPalette(c("blue","gray","red"))(100) )
+```
+Cluster 1 and 4 are T cells
+
+The data already has a cell-type annotation. We can compare the overlap between
+the cell-type annotation (rows below) from the paper authors with our Seurat cluster (columns):
+
+```{r}
+table(
+   seu@meta.data$cell_type,
+   seu@meta.data$seurat_clusters ) 
+```
+
+Let's go on with the authors' cell-type assignment.
+
+```{r}
+UMAPPlot( seu, group.by="cell_type", label=TRUE ) + coord_equal()
+```
+
+#### Expression differences between cell types
+
+Which cells are CD4+ T cells and wich are CD8+ cell types?
+
+```{r}
+wCD8 <- seu@meta.data$cell_type == "CD8+ T"
+wCD4 <- substr( seu@meta.data$cell_type, 1, 6 ) == "CD4+ T"
+```
+
+Calculate for all genes their mean expression in these two cell types:
+```{r}
+means_CD8 <- rowMeans( seu@assays$RNA@data[ , wCD8 ] )
+means_CD4 <- rowMeans( seu@assays$RNA@data[ , wCD4 ] )
+```
+
+Compare them:
+
+```{r}
+plot( means_CD4, means_CD8, asp=1 )
+abline(0,1)
+```
+
+We can also rotate the plot by 45° to get an MA plot:
+
+```{r}
+plot( 
+  ( means_CD4 + means_CD8 ) /2, 
+  means_CD8 - means_CD4, cex=.3 )
+```
+What might be the gene at the top?
+
+```{r}
+head( sort( means_CD8 - means_CD4, decreasing=TRUE ) )
+```
+If we compare this gene's expression between the two groups by t-test
+
+```{r}
+t.test(
+  seu@assays$RNA@data[ "AOAH", wCD8 ],
+  seu@assays$RNA@data[ "AOAH", wCD4 ] )
+```
+The low p value is, however, rather meaningless: As these were two different cell clusters 
+in the *same* sample, it is expected to see strong differences.
+
+### Testing across multiple samples
+
+However, we have multiple samples.
+
+It makes more sense to calculate the mean expression of AOAH in the CD4+ and CD8+ t cells
+from each sample:
+
+```{r}
+# Load the *full* data set:
+  
+obs <- read.csv( "/mnt/raid/anders/tmp/neurips2021BMMC_10XMultiome_GEX/obs.csv.gz", row.names=1 )
+var <- read.csv( "/mnt/raid/anders/tmp/neurips2021BMMC_10XMultiome_GEX/var.csv.gz", row.names=1 )
+counts <- readMM( "/mnt/raid/anders/tmp/neurips2021BMMC_10XMultiome_GEX/counts.mtx.gz" )
+
+rownames(counts) <- rownames(obs)
+colnames(counts) <- rownames(var)
+```
+
+Make a table with the needed data, for the gene AOAH, with one row per cell:
+
+```{r}
+suppressPackageStartupMessages( 
+  library( tidyverse ) )
+
+tibble(
+  cell = rownames(counts),
+  gene_count = counts[,"AOAH"],
+  total = rowSums(counts),
+  cell_type = obs$cell_type,
+  batch = obs$batch,
+  donor = obs$DonorNumber ) -> tbl
+
+head( tbl )
+```  
+
+Now, we can subset only to the T cells, then average over the cells from each donor
+
+```{r}
+tbl %>%
+filter( cell_type %in% c( "CD4+ T naive", "CD4+ T activated", "CD8+ T" ) ) %>%
+mutate( simple_cell_type = str_sub( cell_type, 1, 6 ) ) %>%
+mutate( expr = log( gene_count / total * 1e4 + 1 ) ) %>%
+group_by( simple_cell_type, donor ) %>%
+summarise( mean(expr) ) %>%
+pivot_wider( names_from = "simple_cell_type", values_from = "mean(expr)" ) -> tbl2
+
+tbl2
+```
+We compare these with aa paired t test
+
+```{r}
+t.test( tbl2$`CD4+ T`, tbl2$`CD8+ T`, paired=TRUE )
+```
+Now, we have a actually useful p value, rejecting the null hypothesis that there
+is no difference in the expression of AOAH between CD4+ and CD8+ t cells.
+
+Here, we have first log-normalized the data, then averaged over cells.
+
+There are some arguments in favour of summing up the counts over the cells and dividing 
+by the sum of the totals instead, and taking the log of that. This is called making a "pseudo-bulk":
+
+```{r}
+tbl %>%
+filter( cell_type %in% c( "CD4+ T naive", "CD4+ T activated", "CD8+ T" ) ) %>%
+mutate( simple_cell_type = str_sub( cell_type, 1, 6 ) ) %>%
+group_by( simple_cell_type, donor ) %>%
+summarise( m = log( sum(gene_count)/sum(total) ) ) %>%
+pivot_wider( names_from = "simple_cell_type", values_from = "m" ) -> tbl2b
+  
+t.test( tbl2b$`CD4+ T`, tbl2b$`CD8+ T`, paired=TRUE )
+```

@@ -1,0 +1,278 @@
+---
+title: "Single-cell analysis II"
+format: html
+---
+
+## Course "Advanced Computational Systems Biology"
+
+University of Heidelberg, summer term 2023
+
+## Single-cell RNA-Seq data analysis
+### Day 2: Pseudotime
+
+Simon Anders
+
+### Example data
+
+This time, we use data from this paper:
+
+D Carvajal Ibañez, M Skabkin, J Hooli et al.: *Interferon regulates neural stem cell function at all ages by orchestrating mTOR and cell cycle*. EMBO Molecular Medicine (2023) 15:e16434. https://doi.org/10.15252/emmm.202216434
+
+The data is here: https://papagei.bioquant.uni-heidelberg.de/simon/Vl23sysbiol/ifnagrko/
+
+We load the data as before:
+
+```{r}
+suppressPackageStartupMessages({
+  library( Matrix )
+  library( Seurat )
+  library( tidyverse ) })
+
+mtx_mm <- read.delim( gzfile( "/mnt/raid/ifnagrko/ifnagrko_raw_counts.mtx.gz" ), 
+    comment.char="%", sep=" ", header=FALSE )
+
+cells <- read.csv( "/mnt/raid/ifnagrko/ifnagrko_obs.csv", row.names = 1 )
+genes <- read.csv( "/mnt/raid/ifnagrko/ifnagrko_var.csv", row.names = 1 )
+counts <- readMM( "/mnt/raid/ifnagrko/ifnagrko_raw_counts.mtx.gz" )
+rownames(counts) <- rownames(cells)
+colnames(counts) <- genes$gene_name
+```
+
+### Standard analysis
+
+Run a standard Seurat analysis, as on previous day
+
+```{r}
+set.seed( 12345678 )
+
+seu <- CreateSeuratObject( 
+  t(counts), 
+  meta.data = cells )
+
+seu <- NormalizeData( seu )
+seu <- FindVariableFeatures( seu )
+seu <- ScaleData( seu )
+seu <- RunPCA( seu )
+seu <- RunUMAP( seu, dims=1:20 )
+
+UMAPPlot( seu, group.by="celltype", label=TRUE) + coord_equal()
+```
+
+
+### Looking at pseudotime in the "lineage"
+
+For the cells within the "lineage", a pseudotime has been calculated. Plot it:
+
+```{r}
+bind_cols(
+  seu@reductions$umap@cell.embeddings,
+  dpt = seu@meta.data$dpt_pseudotime ) %>%
+ggplot +
+  geom_point( aes( x=UMAP_1, y=UMAP_2, col=dpt ), size=.1 ) +
+  coord_equal() +
+  scale_color_viridis_c()
+```
+
+Our UMAP looks a bit different from the one the paper's authors have calculated
+and placed in their meta data table:
+
+```{r}
+seu@meta.data %>%
+  ggplot + geom_point( aes( x=UMAP1, y=UMAP2, col=dpt_pseudotime ), size=.1) +
+  coord_equal() + scale_color_viridis_c()
+```
+
+The dividing cells (marked by Ki-67) are here:
+
+```{r}
+FeaturePlot( seu, "Mki67" )
+```
+
+### Regression cell expression on the lineage
+
+The astrocyte marker Aqp4 is high in early pseudotime and goes down quickly
+
+```{r}
+FeaturePlot( seu, "Aqp4" )
+```
+Plot its expression agains pseudotime
+
+```{r}
+tibble(
+   expr = seu@assays$RNA@data["Aqp4",],
+   pt = seu@meta.data$dpt_pseudotime ) %>%
+mutate( expr = ifelse( expr > 0, expr, runif( n(), -.2, 0 ) ) )  %>%
+ggplot +
+  geom_point( aes( x=pt, y=expr ), size=.1, alpha=.3 )
+```
+
+Here, we have expanded the cells with zero expression to a narrow band, to
+reduce overplotting
+
+### Averages per bin
+
+We divide the pseudotime into 20 "bins" and average the expression of Aqp4
+over the cells of each bin. We do this for each of the 4 samples separately
+
+```{r}
+tibble(
+  expr = seu@assays$RNA@data["Aqp4",],
+  pt = seu@meta.data$dpt_pseudotime,
+  genotype = seu@meta.data$genotype,
+  age = seu@meta.data$age ) %>%
+mutate( ptbin = round( pt*20 )/20 ) %>%
+group_by( ptbin, genotype, age  ) %>%
+summarise( mean(expr), n() ) %>%
+ggplot +
+  geom_line( aes( x=ptbin, y=`mean(expr)`, 
+      col=genotype, linetype=age ) )
+```
+
+For comparison, here is the expression as feature plot, split by sample:
+
+```{r}
+bind_cols(
+   seu@reductions$umap@cell.embeddings,
+   expr = seu@assays$RNA@data["Aqp4",],
+   seu@meta.data ) %>% 
+mutate( ptbin = round(dpt_pseudotime*30)/30 ) %>%
+ggplot + 
+  geom_point( aes( x=UMAP_1, y=UMAP_2, col=expr ), size=.1 ) +
+  coord_equal() + scale_color_viridis_c(direction=-1) +
+  facet_grid( age ~ genotype )
+```
+
+### Local regression
+
+A smoother curve can be found by performing a running mean (i.e.,
+averaging over a sliding window), by performin kernel smoothing
+(weighting the cells within the sliding window according to their
+distance to the window center), or by performing local regression
+(also known as LOWESS or LOESS smoothing).
+
+To keep things simple, we will not split by sample this time.
+
+Here's the table of the data we'll need.
+
+```{r}
+tibble(
+  expr = seu@assays$RNA@data["Aqp4",],
+  count = seu@assays$RNA@counts["Aqp4",],
+  total = colSums( seu@assays$RNA@counts ),
+  pt = seu@meta.data$dpt_pseudotime ) %>%
+mutate( expr = log( count/total * 1e4 + 1 ) ) %>%
+filter( !is.na(pt) ) -> tbl
+
+head( tbl )
+```
+
+Here's the LOESS fit:
+
+```{r}
+library(locfit)
+
+fit <- locfit( expr ~ lp(pt,nn=.1), tbl, 
+          ev=lfgrid( 100, 0, 1 ) )  
+
+plot( tbl$pt, tbl$expr, col="gray")
+lines( fit$eva$xev, predict(fit) )
+```
+Explanation: The locfit function regresses the log-normalized expression (column expr)
+onto the pseudotime (column pt), hence `expr ~ pt`, using the data in `tbl`. For each
+x value of the curve, the y value is calculated by taking all data points under the kernel,
+weight them according to the kernel, fit a regression line, and keep only the one point of the regression
+line at the x position we are caclulating. The kernel's width is adjusted such that
+it always covers 10% of the data points (`nn=0.1`).
+
+This is calculated for 100 points between 0 and 1 (`lfgrid` argument), and these 100
+equi-spaced values are then in `fit$eva$xev`. the corresponding y coordinates are in 
+`predict(fit)`.
+
+### Local GLM regression
+
+Our expression values are distorted by the pseudocount in the log-normalization. The
+scaling factor (`1e4`, see previous day) directly influences the gap between the zeroes
+and the other values, which is artifactual.
+
+Making locfit aware that this is Poisson-distributed data and providing it with the
+raw data (`count` and `total` instead of `expr`) rectifies all this:
+
+```{r}
+fit <- locfit( count ~ lp(pt,nn=.1), tbl, 
+               family="poisson", base=log(tbl$total),
+               ev=lfgrid( 100, 0, 1 ) )  
+plot( tbl$pt, tbl$expr, col="gray", ylim=c(-4,4) )
+lines( seq(0,1,l=100), log( predict(fit) * 1e4 ) )
+```
+
+Now, can see that expression keeps falling, with cells with non-zero expression getting more and more rare.
+
+### Several genes
+
+Here is the code from the previous section in a function:
+
+```{r}
+locfitpois <- function( counts, totals, pseudotimes ) {
+  fit <- locfit( 
+    counts ~ lp( pseudotimes, nn=.1 ),  
+        ev = lfgrid( 100, 0, 1 ),
+        family = "poisson",
+        base = log(totals) )
+  tibble( 
+     x = fit$eva$xev,
+     y = predict(fit) )
+}
+```
+
+Testing it:
+
+```{r}
+gene <- "Lhx2"
+
+fit <- locfitpois( 
+  seu@assays$RNA@counts[gene,], 
+  seu@meta.data$nCount, 
+  seu@meta.data$dpt_pseudotime )
+
+plot(   
+   seu@meta.data$dpt_pseudotime,
+   seu@assays$RNA@data[gene,], 
+   col = "gray", pch=".", ylim=c(-4,4) )
+
+lines( fit$x, log(fit$y*1e4) )
+```
+
+Let's run this for several genes:
+
+```{r}
+genes <- c( "Aqp4", "Mki67", "Lhx2")
+
+genes %>% set_names() %>%
+map_dfc( function(gene)
+  locfitpois( 
+    seu@assays$RNA@counts[gene,], 
+    seu@meta.data$nCount, 
+    seu@meta.data$dpt_pseudotime )$y ) -> m
+
+head( m )
+```
+
+Image of this matrix
+
+```{r}
+image(as.matrix(m))
+```
+With proper labels:
+
+```{r}
+image( as.matrix(m), xlab="pseudotime", yaxt="n" )
+axis( 2, seq( 0, 1, length.out=ncol(m) ), colnames(m), las=2 )
+```
+We should make such a heatmap with a few more interesting genes to learn something about 
+how the cells' expression patterns change during the path through pseudotime.
+
+### Further reading
+
+- A lecture on kernel smoothing and local regression: https://papagei.bioquant.uni-heidelberg.de/simon/Vl23sco/smoothing.html
+
+- A lecture on diffusion pseudotime: https://papagei.bioquant.uni-heidelberg.de/simon/Vl23sco/diffdist.html
