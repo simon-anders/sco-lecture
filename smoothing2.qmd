@@ -1,0 +1,572 @@
+---
+title: "Smoothing II"
+format: html
+---
+
+
+## Applied Mathematics in Biology: Single Cell Omics
+
+Lecture Notes
+
+Simon Anders, Univ. Heidelberg, 2023-07
+
+## Smoothing II (Preliminary Notes)
+
+### Standard preprocessing
+
+The packages we need today:
+
+```{r}
+suppressPackageStartupMessages({
+  library( Matrix )
+  library( sparseMatrixStats )
+  library( Seurat )
+  library( tidyverse )
+  library( locfit ) })
+```
+
+We again use the IFNAGRKO data set
+
+```{r}
+cells <- read.csv( "/mnt/raid/ifnagrko/ifnagrko_obs.csv", row.names = 1 )
+genes <- read.csv( "/mnt/raid/ifnagrko/ifnagrko_var.csv", row.names = 1 )
+counts <- readMM( "/mnt/raid/ifnagrko/ifnagrko_raw_counts.mtx.gz" )
+rownames(counts) <- rownames(cells)
+colnames(counts) <- genes$gene_name
+counts <- t(counts)
+```
+First the standard preprocessing steps.
+
+Log-normalization:
+
+```{r}
+fracs <- t( t(counts) / colSums(counts) )
+lfracs <- log1p( fracs*1e4 )
+```
+
+Finding highly variable genes:
+
+```{r}
+rowVars( fracs, useNames=TRUE ) %>% sort(decreasing=TRUE) %>%
+  head(1500) %>% names() -> hvg
+```
+
+PCA:
+
+```{r}
+pca <- irlba::prcomp_irlba( t(lfracs[hvg,]), 20, work=200 )
+rownames(pca$x) <- colnames(lfracs)
+rownames(pca$rotation) <- hvg
+```
+
+UMAP:
+
+```{r}
+set.seed( 12345678 )
+nn <- FNN::get.knn( pca$x, 30 )
+names(nn) <- c( "idx", "dist" )
+
+ump <- uwot::umap( pca$x, nn_method=nn, min_dist=.2 )
+plot( ump, pch=".", asp=1, col=1+(cells$celltype2=="qNSC1") )
+```
+
+In the UMAP plot, we have highlighted the quiescent neuronal stem cells, to
+mark the beginning of the lineage.
+
+
+### Recap: Smoothing by local regression
+
+We make a table of expression data for aquaporin 4 (Aqp4, an astrocyte marker, present 
+in the NSCs)
+
+```{r}
+tibble(
+  cell = colnames(counts),
+  count = counts[ "Aqp4", ],
+  total = colSums(counts),
+  celltype = cells$celltype,
+  lineage = cells$celltype1 == "lineage",
+  pt = cells$dpt_pseudotime,
+  jitter = 10^runif( ncol(counts), -5, -4.7 ) 
+) -> tbl0
+
+head( tbl0 )
+```
+
+As before, we smooth along pseudotime. So, let's have a look at it again:
+
+```{r}
+cbind( 
+  as_tibble(ump),
+  tbl0 ) %>%
+ggplot() + 
+  geom_point(aes(x=V1,y=V2,col=pt), size=.1) +
+  coord_equal() + scale_color_viridis_c()
+```
+The pseudotime is defined only within the lineage, so we subset to these cells:
+
+```{r}
+tbl0 %>% filter( lineage ) -> tbl
+```
+
+Let's plot the expression fractions for Aqp4 versus the pre-defined pseudotime:
+
+```{r}
+plot( count/total + 1e-5 ~ pt, tbl, log="y", cex=.1 )
+```
+
+To make the zeroes better visible, we replace them with the "jitter", i.e., the small 
+random numbers that we put above in the column "jitter".
+
+```{r}
+plot( pmax( count/total, jitter ) ~ pt, tbl, log="y", cex=.1 )
+```
+
+Let's smooth with local regression (locfit):
+
+We prepare a grid of 1000 values between 0 and 1 (ptg), and ask for smoothed 
+fitted values for these by running locfit as follows:
+
+```{r}
+ptg <- seq( 0, 1, l=1000 )
+
+fit <- locfit( 
+  count ~ lp( pt, nn=.2 ), tbl, 
+  family="poisson", base=log(tbl$total), ev=ptg )
+
+fitted_curve = tibble( x=ptg, y=predict(fit) )
+head( fitted_curve )
+```
+
+With this call, locfit does local regression, fitting quadratic polynomials
+locally via GLM with Poisson likelihood and log link, using a kernel with 
+adaptive bandwidth such that the kenrel always covers a fraction of 0.2 
+of the cells. We have regressed the counts onto the pseudotime, using the log totals
+as offsets.
+
+Here's a plot of the fitted curve:
+```{r}
+plot( pmax( count/total, jitter/10 ) ~ pt, tbl, log="y", cex=.1, ylim=c(1e-6, 5e-3) )
+lines( y ~ x, fitted_curve, col="magenta" )
+```
+### Deviance
+
+We call locfit ones more, this time asking for evaluation not along our value grid `ptg`, but
+for the cells' actual pseudotime values, and then write the fitted values into a new
+table column `pred_expr`:
+
+```{r}
+fit <- locfit( count ~ lp( pt, nn=.2 ), tbl, family="poisson", base=log(tbl$total), ev=tbl$pt )
+tbl$pred_expr <- predict(fit)
+
+head(tbl)
+```
+
+Let's write $k_i$ for the UMI count (`count`)for our gene (Aqp4) for cell $i$, $s_i$ for the cell's total count (`total`)
+and $\hat y_i$ for the fitted curve value (`pred_expr`). The log likelihood that was maximized by `locfit` is the expression
+$\sum_i\log f_\text{Pois}(k;\hat y_i s_i)$, where $f_\text{Pois}$ is the Poisson probability mass function, i.e., the $f_\text{Pois}(k,\lambda)$
+is the for a random variable that is Poisson distributed with expectation $\lambda$ to take the value $k$: $f_\text{Pois}(k,\lambda) = \lambda^k e^{-\lambda}/k!$. In R, the function `dpois` calculates this fucntion, or (if one sets log=TRUE) its logarithm.
+
+It is useful to compare for each cell the log likelihood of a fitted value $\hat\lambda_i=s_i\hat y_i$, i.e., $\log f_\text{Pois}(k,\lambda_i)$ with the maximum likelihood that could be achieved if $\lambda_i$ could be chosen freely. The log likelihood function $\log f_\text{Pois}(k,\lambda)$ takes its
+maximum w.r.t. to $\lambda$ for $\lambda=k$, and this is then called the likelihood of the saturated model. The difference between the attained maximum
+likelihood and the saturated likelihood tells us something about the goodness of fit. Hence, we define
+$$ D_i = -2\left( \log f_\text{Pois}(k_i,\lambda_i) - \log f_\text{Pois}(k_i,k_i) \right) $$
+as the *deviance* of the fit for cell $i$.
+
+Why is there a prefactor $-2$? TO see, consider how $D-I$ would look if we had done ordinary least square (OLS) regression, i.e.,
+tried to maximize a normal likelihood in order to get a fitted value $\hat y_i$ clsoe to an observed value $y_i$. Then, we would
+write $D_i = -2\left( \log f_\mathcal{N}(y_i;\hat y_i, \sigma) - \log f_\mathcal{N}(y_i; y_i, \sigma) \right)$, which, after inserting the 
+normal density $f_\mathcal{N}(y;\mu, \sigma) = e^{-(y-\mu)^2/2\sigma^2}/\sqrt{2\pi\sigma^2}$, simplifies to $D_i = (y_i-\hat y_i)^2/\sigma^2$.
+The prefactor 2 cancels against the 2 in front of $\sigma^2$ in the normal pdf, and we are left with the square of $z=(y_i-\hat y_i)/\sigma$, i.e.,
+of the residual scaled by the standard deviation, which is often called the $z$-value. 
+
+So, maximizing the likelihood in a GLM fit means minimizing the deviance, which is an generalization of the sum of squares that we minimize in
+OLS regression. The least-square criterion is motivated by it minimizing the residual variance, and this explains why we call $D_i$ the "deviance",
+a generalization of the residual variance.
+
+The connection to the $z$ value motivated transforming the deviance into a "generalized z value" or "deviance residual" 
+by taking the square root and putting a sign as needed to indicate whether the data point lies above or below the fitted curve:
+
+$$ z_i = \sqrt{D_i}\, \operatorname{sgn}(k_i-s_i\hat y_i). $$
+Here, we add deviance and deviance residual:
+
+```{r}
+tbl %>%
+mutate( deviance = -2 * ( 
+  dpois( count, total * pred_expr, log=TRUE ) - 
+  dpois( count, count, log=TRUE ) ) ) %>%
+mutate( devres = sqrt(deviance) * sign( count - total*pred_expr ) ) %>%
+mutate( y = pmax( count/total, jitter/10 ) ) -> tbl
+
+head( tbl )
+```
+
+Let's plot our fit again, now coloring the points by deviance residual:
+
+```{r}
+ggplot(tbl) + 
+  geom_point( aes( x=pt, y=y, col=devres ), size=.3 ) +
+  geom_line( aes( x=x, y=y ), data=fitted_curve, lty="dotted" ) +
+  scale_y_log10() +
+  scale_color_gradient2( mid="gray80", limits=c(-2.5,2.5), oob=scales::oob_squish ) +
+  theme_bw()
+```
+Here's a histogram of the deviance residuals:
+
+```{r}
+hist( tbl$devres, 100 )
+```
+This now allows us to judge whether the remaining variance or deviance, that has not
+been explained by the fit is mostly due to Poisson variation. If this were the case,
+this histogram should look roughly standard-normal -- if not in shape then at least with respect to
+fastness of the tails.
+
+A QQ plot help judging this:
+
+```{r}
+qqnorm( tbl$devres )
+abline( 0, 1 )
+```
+
+There clearly is variation in excess of what we expect due to the Poisson distribution
+
+### Negative binomial instead of Poisson
+
+Let's assume that the biological variation is 10%. By this we mean that given a sample
+of cells with the same pseudotime values, we expect their pre-Poisson expression, i.e.,
+their values $y_i$ that go into the Poisson, vary with a coefficient of variation of 
+$\gamma=0.1$.
+
+To write this up more formal: Given a number of cells (indexed by $i$)
+with the *same* pseudotime, we assume that the cells' counts $K_i$ follow 
+$$ K_i|Y_i \sim \text{Pois}(s_i Y_i), $$
+where the  $Y_i$ are drawn i.i.d. from a distribution with $ \operatorname{E}Y_i=\mu$ and
+$\operatorname{Var}K_i=(\gamma\mu)^2$.  Of course, $\operatorname{E}(K_i|Y_i)=\operatorname{Var}(K_i|Y_i)=s_iY_i$.
+
+Using the [law of total expectation](https://en.wikipedia.org/wiki/Law_of_total_expectation),
+we find that $\operatorname{E} K_i = s_i \mu$ and from the [law of total variance](https://en.wikipedia.org/wiki/Law_of_total_variance),
+that 
+$$\begin{align}
+\operatorname{Var}K_i &= \operatorname{E}\left(\operatorname{Var}(K_i|Y_i)\right) + \operatorname{Var}\left(\operatorname{E}(K_i|Y_i)\right)\\
+&= \operatorname{E}(s_iY_i) + \operatorname{Var}(s_iY_i) \\
+&= s_i\operatorname{E}Y_i + s_i^2\operatorname{Var}Y_i\\
+&=s_i\mu + s_i^2\gamma^2\mu^2.
+\end{align}
+$$
+For the coefficient of variation, we get
+$$ \operatorname{CV}{K_i} = \frac{\sqrt{\operatorname{Var}K_i}}{\operatorname{E}K_i} = \sqrt{ \frac{1}{s_i\mu} + \gamma^2 }$$
+We see that the variance of $K_i$ decomposes in two parts: the first captures the Poisson noise and its contribution to the CV drops proportional
+to $\sqrt{\mu}$; the second part is constant and described the biological variation (which we deemed to have fixed CV).
+
+In order to get an explicit probability mass function $f_K$ for the $K_i$, we should choose a probability density 
+function $f_Y$ for the $Y_i$, so that we can calculate
+
+$$f_K(k) := \text{Prob}(K_i=k ) = \int f_\text{Pois}(k;y)f_Y(y)\text{d}y$$
+(where we omitted the size factors $s_i$ for now).
+
+It would seem to be a good choice to use a normal or log-normal pdf for $f_Y$, but, unfortunately, this results in an 
+integral that cannot be solved in closed form. However, if we use the [Gamma distribution](https://en.wikipedia.org/wiki/Gamma_distribution)
+for $f_Y$, the integra for $f_K$ yields a closed-form expression which is called the *negative-binomial (NB) distribution*, or
+the *Gamma-Poisson distribution*. The calculation can be seen [here on Wikipedia](https://en.wikipedia.org/wiki/Negative_binomial_distribution#Gamma–Poisson mixture).
+
+In R, the NB distribution's pmf is given by `dnbinom`, which allows two parametrization. We chose to specify the mean $\mu$ as `mean`
+and the parameter `size`, which corresponds to $1/\gamma^2$ in our notation.
+
+We calculate the NB deviance for $\gamma=0.1$ and the corresponding deviance residuals:
+
+```{r}
+tbl %>%
+mutate( deviance_nb = -2 * ( 
+  dnbinom( count, mu = total * pred_expr, size = 1/.1^2, log=TRUE ) - 
+  dnbinom( count, mu = count, size = 1/.01, log=TRUE ) ) ) %>%
+mutate( devres_nb = sqrt(deviance_nb) * sign( count - total*pred_expr ) ) -> tbl
+
+head(tbl)
+```
+Now, the gray band is a bit wider:
+
+```{r}
+tbl %>% 
+ggplot() + 
+  geom_point( aes( x=pt, y=y, col=devres_nb ), size=.3 ) +
+  geom_line( aes( x=x, y=y ), data=fitted_curve, lty="dotted" ) +
+  scale_y_log10() +
+  scale_color_gradient2( mid="gray80", limits=c(-2.5,2.5), oob=scales::oob_squish ) +
+  theme_bw()
+```
+
+Here's the histogram of the NB deviance residuals, and their QQ plot against a standard normal:
+
+```{r}
+hist( tbl$devres_nb, 100 )
+qqnorm( tbl$devres )
+abline( 0, 1 )
+```
+
+### Nearest-neighbor smoothing
+
+Smoothing may serve two purposes: (i) to more clearly see the influence of a specific
+continuously varying covariate on some measured quantity, or (ii) to remove noise
+from a measured quantity.
+
+Now that we know that pseudotime does not explain all of the non-Poisson variance,
+we see that our local regression on pseudotime is useful for purpose (i), but to
+perform general denoising (ii), we are better with another approach.
+
+A very simple one is this: Let's just average of each cell's $k$ nearest neighbors.
+
+We've got a table of nearest neighbors further ip, using FNN:
+
+```{r}
+head( nn$idx )
+```
+
+Let's first get vectors of the counts for Aqp4 and for the totals:
+
+```{r}
+counts_Aqp4 <- counts[ "Aqp4", ]  
+totals <- colSums(counts)
+```
+
+Now, let's sum up, for each cell, the Aqp4 counts of its 30 neighbors:
+
+```{r}
+counts_Aqp4_nnsum <- unname( rowSums( 
+  sapply( 1:ncol(nn$idx), function(j) counts_Aqp4[nn$idx[,j] ] ) ) )
+```
+
+Do the same for the totals
+
+```{r}
+totals_nnsum <- unname( rowSums( 
+  sapply( 1:ncol(nn$idx), function(j) totals[nn$idx[,j] ] ) ) )
+```
+
+Fix the cell names:
+
+```{r}
+names(counts_Aqp4_nnsum) <- names(counts_Aqp4)
+names(totals_nnsum) <- names(totals)
+```
+
+Now, calculate the expression fractions as ratio of the neighborhood-summed
+Aqp4 counts to the neighborhood-summed totals:
+
+```{r}
+tbl %>%
+mutate( y_nnsum = ( counts_Aqp4_nnsum / totals_nnsum )[ cell ] ) %>%
+mutate( y_nnsum = pmax( y_nnsum, 10^runif( n(), -6.4, -6 ) ) ) -> tbl
+
+head(tbl)
+```
+
+Let's first compare this with our fitted curves. The points are now
+the neighborhood-smoothed expressions:
+
+```{r}
+ggplot(tbl) + 
+  geom_point( aes( x=pt, y=y_nnsum ), size=.3, alpha=.4 ) +
+  geom_line( aes( x=x, y=y ), data=fitted_curve, col="magenta" ) +
+  scale_y_log10() 
+```
+We see that we now get useful value even in the range below $10^{-4}$.
+
+Here is again the plot of the Aqp4 expression in the UMAP, first using only
+the cell's own counts then using the sum over its neighbors:
+
+```{r}
+as_tibble(ump) %>%
+mutate( y = log( counts_Aqp4/totals * 1e4 + 1 ) ) %>%
+ggplot + 
+  geom_point( aes( x=V1, y=V2, col=y ), size=.1 ) +
+  coord_equal() + 
+  scale_color_viridis_c( direction=-1, limits=c(0,3.5), oob=scales::squish )
+
+as_tibble(ump) %>%
+mutate( y = log( counts_Aqp4_nnsum/totals_nnsum * 1e4 + 1 ) ) %>%
+ggplot + 
+  geom_point( aes( x=V1, y=V2, col=y ), size=.1 ) +
+  coord_equal() + 
+  scale_color_viridis_c( direction=-1, limits=c(0,3.5), oob=scales::squish )
+```
+We see how the "salt-and-pepper pattern" is smoothed over.
+
+We can also ask whether the smoothing has caused the expression of some cells
+to now deviate more strongly than what we would expect if the smoothing only 
+corrected for Poisson noise. We can spot such cases of "over-smoothing" by checking
+for large Poisson residuals:
+
+```{r}
+deviance_nn <- -2 * (
+  dpois( counts_Aqp4, totals * counts_Aqp4_nnsum/totals_nnsum, log=TRUE ) -
+  dpois( counts_Aqp4, counts_Aqp4, log=TRUE ) )
+
+devres_nn <- sqrt( deviance_nn ) * sign( counts_Aqp4 - totals * counts_Aqp4_nnsum/totals_nnsum )
+
+as_tibble(ump) %>%
+mutate( devres = devres_nn ) %>%
+ggplot + 
+  geom_point( aes( x=V1, y=V2, col=devres ), size=.1 ) +
+  coord_equal() + theme_bw() +
+  scale_color_gradient2( mid="gray80", limits=c(-4,4), oob=scales::squish ) 
+```
+### PCA smoothing
+
+Instead of simply averaging over the neighborhood, we can also use
+our PCA (calculated at the very beginning of this notebook) to
+denoise the data. We simply rotate the PCA scores back into feature
+space and undo the centering (as discussed a few weeks ago):
+
+```{r}
+expr_pca_smoothed <- t( pca$x %*% t(pca$rotation) ) + pca$center
+```
+
+Here's the smoothing result
+
+```{r}
+as_tibble(ump) %>%
+mutate( y = expr_pca_smoothed["Aqp4",] ) %>%
+ggplot + 
+  geom_point( aes( x=V1, y=V2, col=y ), size=.1 ) +
+  coord_equal() + 
+  scale_color_viridis_c( direction=-1, limits=c(0,3.5), oob=scales::squish )
+```
+To get to the deviance residuals, we have to also undo the log-normalization:
+
+```{r}
+pca_pred_counts <- totals * exp( expr_pca_smoothed["Aqp4",] ) / 1e4
+
+deviance_pca <- -2 * (
+  dpois( counts_Aqp4, pca_pred_counts, log=TRUE ) -
+  dpois( counts_Aqp4, counts_Aqp4, log=TRUE ) )
+
+devres_pca <- sqrt( deviance_pca ) * sign( counts_Aqp4 - pca_pred_counts )
+
+as_tibble(ump) %>%
+mutate( devres = devres_pca ) %>%
+ggplot + 
+  geom_point( aes( x=V1, y=V2, col=devres ), size=.1 ) +
+  coord_equal() + theme_bw() +
+  scale_color_gradient2( mid="gray80", limits=c(-4,4), oob=scales::squish ) 
+```
+It's all a bit reddish. Plotting against pseudotime sheds light at the issue:
+
+```{r}
+tbl %>%
+mutate( y = exp( expr_pca_smoothed["Aqp4",cell] ) / 1e4 ) %>%
+ggplot() + 
+  geom_point( aes( x=pt, y=y ), size=.3 ) +
+  geom_line( aes( x=x, y=y ), data=fitted_curve, col="magenta" ) +
+  scale_y_log10() 
+```
+Because we performed the PCA on log-normalized data where we added the small value $10^{-4}$,
+our PCA prediction cannot drop much below this value, and the subtle signal at later pseudotime
+gets lost.
+
+#### GLM-PCA
+
+If we replaced the PCA with a procedure that does essentially the same but is able
+to work directly with counts, doing away with the needs to mask this, we get a better
+fit. 
+
+How to do this will be shown in the nect lecture, but here is already the result:
+
+```{r}
+read_lines("Aqp4_glmpca.txt") %>% as.numeric() -> Aqp4_glmpca
+
+head( Aqp4_glmpca )
+```
+Here's a plot of these "GLM-PCA denoised" values:
+
+```{r}
+as_tibble(ump) %>%
+  mutate( y = Aqp4_glmpca ) %>%
+  ggplot + 
+  geom_point( aes( x=V1, y=V2, col=y ), size=.1 ) +
+  coord_equal() + 
+  scale_color_viridis_c( direction=-1, limits=c(0,3.5), oob=scales::squish )
+```
+
+Again, the residuals:
+
+```{r}
+glm_pca_pred_counts <- totals * exp( Aqp4_glmpca ) / 1e4
+
+deviance_glm_pca <- -2 * (
+  dpois( counts_Aqp4, glm_pca_pred_counts, log=TRUE ) -
+  dpois( counts_Aqp4, counts_Aqp4, log=TRUE ) )
+
+devres_glm_pca <- sqrt( deviance_glm_pca ) * sign( counts_Aqp4 - glm_pca_pred_counts )
+
+as_tibble(ump) %>%
+mutate( devres = devres_glm_pca ) %>%
+ggplot + 
+  geom_point( aes( x=V1, y=V2, col=devres ), size=.1 ) +
+  coord_equal() + theme_bw() +
+  scale_color_gradient2( mid="gray80", limits=c(-4,4), oob=scales::squish ) 
+```
+The plot against the pseudotime now dips down deeper, and follows the fit well
+much longer:
+
+```{r}
+tbl %>%
+mutate( y = exp( Aqp4_glmpca[cells$celltype1=="lineage"] ) / 1e4 ) %>%
+ggplot() + 
+  geom_point( aes( x=pt, y=y ), size=.3, alpha=.3 ) +
+  geom_line( aes( x=x, y=y ), data=fitted_curve, col="magenta" ) +
+  scale_y_log10() 
+```
+What's happening at the end? Is this the fault of locfit or of GLM-PCA. This 
+is not clear at this point, so we leave the question open for now.
+
+### Autoencoder
+
+The next step over the GLM-PCA will be to replace it with a non-linear procedure.
+In one of the next lectures, we will learn how such an autoencoder works, but here is already
+the result.
+
+Load the autoencoder-denoised data:
+
+```{r}
+read_lines("Aqp4_ae.txt") %>% as.numeric() -> Aqp4_ae_pred_counts
+```
+
+Plot it in a UMAP:
+
+```{r}
+as_tibble(ump) %>%
+  mutate( y = log(Aqp4_ae_pred_counts/totals*1e4) ) %>%
+  ggplot + 
+  geom_point( aes( x=V1, y=V2, col=y ), size=.1 ) +
+  coord_equal() + 
+  scale_color_viridis_c( direction=-1, limits=c(0,3.5), oob=scales::squish )
+```
+The residuals:
+
+```{r}
+deviance_ae <- -2 * (
+  dpois( counts_Aqp4, Aqp4_ae_pred_counts, log=TRUE ) -
+  dpois( counts_Aqp4, counts_Aqp4, log=TRUE ) )
+
+devres_ae <- sqrt( deviance_ae ) * sign( counts_Aqp4 - Aqp4_ae_pred_counts )
+
+as_tibble(ump) %>%
+mutate( devres = devres_ae ) %>%
+ggplot + 
+  geom_point( aes( x=V1, y=V2, col=devres ), size=.1 ) +
+  coord_equal() + theme_bw() +
+  scale_color_gradient2( mid="gray80", limits=c(-4,4), oob=scales::squish ) 
+```
+
+And the plot against pseudotime
+
+```{r}
+tbl %>%
+  mutate( y = Aqp4_ae_pred_counts[cells$celltype1=="lineage"] / total * 1e4 ) %>%
+  ggplot() + 
+  geom_point( aes( x=pt, y=y ), size=.3, alpha=.3 ) +
+  geom_line( aes( x=x, y=y*1e4 ), data=fitted_curve, col="magenta" ) +
+  scale_y_log10() 
+```
+It seems our autoencoder has a floor, too, although lower than before. We fix this when we revisit it
+in a later lecture.

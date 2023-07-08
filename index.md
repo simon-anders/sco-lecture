@@ -67,3 +67,7 @@ effect on cell-to-cell distances.
 [Here](princurve.html), we learn how principal curves are used to get a pseudotime,
 and [here](diffdist.html) how diffusion maps are used for this purpose.
 
+### Smoothing II
+
+[Here](smoothing2.html) we learn about smoothing for denoising, and 
+deviance and residuals for diagnostics.
