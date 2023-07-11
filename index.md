@@ -71,3 +71,9 @@ and [here](diffdist.html) how diffusion maps are used for this purpose.
 
 [Here](smoothing2.html) we learn about smoothing for denoising, and 
 deviance and residuals for diagnostics.
+
+### Denoising via autoencoder
+
+In this lecture, we explored how PCA can be solved as an optimization problem,
+implmented this with PyTorch, and generalized to non-linear autoencoders.
+The two Jupyter notebooks are [here](glmpca.ipynb) and [here](simple_ae.ipynb).
